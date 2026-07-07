@@ -17,9 +17,25 @@ INPUT_FILE = "runoff_dataset.xlsx"
 OUTPUT_DIR = "output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-DATE_COL_IDX = 0
-FEATURE_COL_IDXS = list(range(1, 9))   # B..I
-TARGET_COL_IDX = 9                     # J
+EXPECTED_COLS = [
+    "data",
+    "snowmelt",
+    "pet",
+    "precipitation",
+    "surface_sensible_heat_flux",
+    "snowfall",
+    "temperature",
+    "u_component_of_wind",
+    "v_component_of_wind",
+    "runoff",
+]
+
+DATE_COL = "data"
+CLIMATE_COLS = [
+    "snowmelt", "pet", "precipitation", "surface_sensible_heat_flux",
+    "snowfall", "temperature", "u_component_of_wind", "v_component_of_wind",
+]
+RESID_COL = "runoff"
 
 TRAIN_START, TRAIN_END = 1980, 1996
 VAL_START, VAL_END = 1997, 2000
@@ -29,42 +45,32 @@ N_IN = 6
 N_OUT = 3
 STRIDE = 1
 
-EXPECTED_COLS = [
-    "data",
-    "snowmelt_sum_mm",
-    "pet",
-    "total_precipitation_sum_mm",
-    "surface_sensible_heat_flux_sum_MJ",
-    "snowfall_sum_mm",
-    "skin_temperature_celsius",
-    "u_component_of_wind_10m",
-    "v_component_of_wind_10m",
-    "runoff",
-]
+STRICT_COLS = True
 
-def _norm_col(x):
-    return str(x).strip()
+
+def parse_dates(series):
+    s = series.astype(str).str.strip()
+    zh = s.str.replace("年", "-", regex=False).str.replace("月", "", regex=False)
+    dt = pd.to_datetime(zh, format="%Y-%m", errors="coerce")
+    if dt.isna().any():
+        dt = dt.fillna(pd.to_datetime(s, errors="coerce"))
+    return dt
+
 
 def create_supervised_sequences(feature_arr, target_arr, n_in, n_out, stride=1):
     feature_arr = np.asarray(feature_arr, dtype=np.float32)
-    target_arr = np.asarray(target_arr, dtype=np.float32)
-
+    target_arr = np.asarray(target_arr, dtype=np.float32).reshape(-1)
     n = len(feature_arr)
     max_i = n - n_in - n_out + 1
     if max_i <= 0:
-        return (
-            np.empty((0, n_in, feature_arr.shape[1]), dtype=np.float32),
-            np.empty((0, n_out), dtype=np.float32),
-        )
-
-    X_list, Y_list = [], []
+        return (np.empty((0, n_in, feature_arr.shape[1]), np.float32),
+                np.empty((0, n_out), np.float32))
+    X, Y = [], []
     for i in range(0, max_i, stride):
-        X = feature_arr[i : i + n_in, :]
-        Y = target_arr[i + n_in : i + n_in + n_out]
-        X_list.append(X)
-        Y_list.append(Y)
+        X.append(feature_arr[i:i + n_in, :])
+        Y.append(target_arr[i + n_in:i + n_in + n_out])
+    return np.stack(X), np.stack(Y)
 
-    return np.stack(X_list, axis=0), np.stack(Y_list, axis=0)
 
 def build_lstm_attention_model(n_in, n_features, n_out):
     inputs = Input(shape=(n_in, n_features))
@@ -80,61 +86,59 @@ def build_lstm_attention_model(n_in, n_features, n_out):
     outputs = Dense(n_out)(context)
 
     model = Model(inputs, outputs)
-    model.compile(optimizer="adam", loss="mse", metrics=["mae"])
+    model.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss="mse", metrics=["mae"])
     return model
+
 
 dataset = pd.read_excel(INPUT_FILE)
 
-actual_cols = [_norm_col(c) for c in list(dataset.columns[: len(EXPECTED_COLS)])]
-expected_cols = [_norm_col(c) for c in EXPECTED_COLS]
-if actual_cols != expected_cols:
-    raise ValueError(
-        "Input file columns (A..J) do not match the expected names/order.\n"
-        f"Expected: {expected_cols}\n"
-        f"Actual:   {actual_cols}\n"
-        "Please ensure the Excel file has exactly these 10 columns in this order."
-    )
+if STRICT_COLS:
+    actual = [str(c).strip() for c in dataset.columns[:len(EXPECTED_COLS)]]
+    if actual != EXPECTED_COLS:
+        raise ValueError(
+            "Input columns (A..J) do not match the expected README names/order.\n"
+            f"Expected: {EXPECTED_COLS}\n"
+            f"Actual:   {actual}\n"
+            "Set STRICT_COLS = False to map the first 10 columns by position instead."
+        )
+else:
+    dataset = dataset.iloc[:, :len(EXPECTED_COLS)].copy()
+    dataset.columns = EXPECTED_COLS
 
-date_col_name = dataset.columns[DATE_COL_IDX]
-dataset[date_col_name] = pd.to_datetime(dataset[date_col_name])
-dataset = dataset.sort_values(by=date_col_name).reset_index(drop=True)
-dataset["Year"] = dataset[date_col_name].dt.year
-dataset["Month"] = dataset[date_col_name].dt.month
+dataset[DATE_COL] = parse_dates(dataset[DATE_COL])
+dataset = dataset.sort_values(DATE_COL).reset_index(drop=True)
+dataset["Year"] = dataset[DATE_COL].dt.year
+dataset["Month"] = dataset[DATE_COL].dt.month
 
-train_df = dataset[(dataset["Year"] >= TRAIN_START) & (dataset["Year"] <= TRAIN_END)].copy()
-val_df   = dataset[(dataset["Year"] >= VAL_START)   & (dataset["Year"] <= VAL_END)].copy()
-sim_df   = dataset[(dataset["Year"] >= SIM_START)   & (dataset["Year"] <= SIM_END)].copy()
+train_df = dataset[(dataset.Year >= TRAIN_START) & (dataset.Year <= TRAIN_END)].copy()
+val_df = dataset[(dataset.Year >= VAL_START) & (dataset.Year <= VAL_END)].copy()
+sim_df = dataset[(dataset.Year >= SIM_START) & (dataset.Year <= SIM_END)].copy()
 
-train_df = train_df.dropna(subset=[dataset.columns[i] for i in FEATURE_COL_IDXS + [TARGET_COL_IDX]]).copy()
-val_df   = val_df.dropna(subset=[dataset.columns[i] for i in FEATURE_COL_IDXS + [TARGET_COL_IDX]]).copy()
-sim_df   = sim_df.dropna(subset=[dataset.columns[i] for i in FEATURE_COL_IDXS]).copy()
+train_df = train_df.dropna(subset=CLIMATE_COLS + [RESID_COL]).copy()
+val_df = val_df.dropna(subset=CLIMATE_COLS + [RESID_COL]).copy()
+sim_df = sim_df.dropna(subset=CLIMATE_COLS).reset_index(drop=True)
 
-X_train_raw = train_df.iloc[:, FEATURE_COL_IDXS].values
-y_train_raw = train_df.iloc[:, TARGET_COL_IDX].values
-X_val_raw   = val_df.iloc[:, FEATURE_COL_IDXS].values
-y_val_raw   = val_df.iloc[:, TARGET_COL_IDX].values
+x_scaler = MinMaxScaler().fit(train_df[CLIMATE_COLS].values)
+y_scaler = MinMaxScaler().fit(train_df[[RESID_COL]].values)
 
-X_train, Y_train = create_supervised_sequences(X_train_raw, y_train_raw, N_IN, N_OUT, STRIDE)
-X_val,   Y_val   = create_supervised_sequences(X_val_raw,   y_val_raw,   N_IN, N_OUT, STRIDE)
 
-if X_train.shape[0] == 0:
-    raise ValueError("Not enough training data to build supervised samples. Check TRAIN period or N_IN/N_OUT.")
-if X_val.shape[0] == 0:
-    raise ValueError("Not enough validation data to build supervised samples. Check VAL period or N_IN/N_OUT.")
+def scaled_xy(d):
+    x = x_scaler.transform(d[CLIMATE_COLS].values).astype(np.float32)
+    y = y_scaler.transform(d[[RESID_COL]].values).reshape(-1).astype(np.float32)
+    return x, y
+
+
+Xtr_m, ytr_m = scaled_xy(train_df)
+Xva_m, yva_m = scaled_xy(val_df)
+
+X_train, Y_train = create_supervised_sequences(Xtr_m, ytr_m, N_IN, N_OUT, STRIDE)
+X_val, Y_val = create_supervised_sequences(Xva_m, yva_m, N_IN, N_OUT, STRIDE)
+
+if X_train.shape[0] == 0 or X_val.shape[0] == 0:
+    raise ValueError("Not enough data to build supervised samples; check periods / N_IN / N_OUT.")
 
 n_features = X_train.shape[2]
-
-x_scaler = MinMaxScaler()
-y_scaler = MinMaxScaler()
-
-X_train_2d = X_train.reshape((X_train.shape[0], N_IN * n_features))
-X_val_2d   = X_val.reshape((X_val.shape[0],   N_IN * n_features))
-
-X_train_scaled = x_scaler.fit_transform(X_train_2d).reshape((X_train.shape[0], N_IN, n_features))
-X_val_scaled   = x_scaler.transform(X_val_2d).reshape((X_val.shape[0], N_IN, n_features))
-
-Y_train_scaled = y_scaler.fit_transform(Y_train)
-Y_val_scaled   = y_scaler.transform(Y_val)
+print(f"Train: {X_train.shape}, Val: {X_val.shape}, n_features={n_features}")
 
 model = build_lstm_attention_model(N_IN, n_features, N_OUT)
 model.summary()
@@ -142,65 +146,63 @@ model.summary()
 callbacks = [
     tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=20, restore_best_weights=True)
 ]
-
 history = model.fit(
-    X_train_scaled, Y_train_scaled,
-    validation_data=(X_val_scaled, Y_val_scaled),
+    X_train, Y_train,
+    validation_data=(X_val, Y_val),
     epochs=150,
     batch_size=16,
     shuffle=True,
     verbose=1,
-    callbacks=callbacks
+    callbacks=callbacks,
 )
 
-model_path = os.path.join(OUTPUT_DIR, "lstm_attention_runoff.keras")
+model_path = os.path.join(OUTPUT_DIR, "wh_dl_residual.keras")
 model.save(model_path)
-
 with open(os.path.join(OUTPUT_DIR, "x_scaler.pkl"), "wb") as f:
     pickle.dump(x_scaler, f)
 with open(os.path.join(OUTPUT_DIR, "y_scaler.pkl"), "wb") as f:
     pickle.dump(y_scaler, f)
 
+val_pred = y_scaler.inverse_transform(model.predict(X_val, verbose=0).reshape(-1, 1)).reshape(-1)
+val_true = y_scaler.inverse_transform(Y_val.reshape(-1, 1)).reshape(-1)
+vr = np.corrcoef(val_true, val_pred)[0, 1]
+vrmse = float(np.sqrt(np.mean((val_pred - val_true) ** 2)))
+print(f"Validation (1997-2000) residual: R2={vr ** 2:.3f}, RMSE={vrmse:.4f}")
+
 sim_start_date = pd.Timestamp(f"{SIM_START}-01-01")
-base_hist = dataset[dataset[date_col_name] < sim_start_date].dropna(
-    subset=[dataset.columns[i] for i in FEATURE_COL_IDXS]
-).tail(N_IN)
+hist = dataset[dataset[DATE_COL] < sim_start_date].dropna(subset=CLIMATE_COLS).tail(N_IN)
+if len(hist) < N_IN:
+    raise ValueError("Not enough history before 2001 to build the initial input window.")
 
-if len(base_hist) < N_IN:
-    raise ValueError("Not enough history before simulation start to build the initial input window.")
+window = x_scaler.transform(hist[CLIMATE_COLS].values).astype(np.float32)
+sim_climate_scaled = x_scaler.transform(sim_df[CLIMATE_COLS].values).astype(np.float32)
+n_sim = len(sim_climate_scaled)
 
-current_input = base_hist.iloc[:, FEATURE_COL_IDXS].values.astype(np.float32)
-future_features = sim_df.iloc[:, FEATURE_COL_IDXS].values.astype(np.float32)
+pred_scaled_all = []
+t = 0
+while len(pred_scaled_all) < n_sim:
+    x_in = window[-N_IN:, :].reshape(1, N_IN, n_features)
+    p = model.predict(x_in, verbose=0)[0]
+    take = min(N_OUT, n_sim - len(pred_scaled_all))
+    pred_scaled_all.extend(p[:take].tolist())
 
-future_preds = []
-for i in range(0, len(future_features), N_OUT):
-    if len(current_input) < N_IN:
-        pad = np.zeros((N_IN - len(current_input), n_features), dtype=np.float32)
-        window = np.vstack([pad, current_input])
-    else:
-        window = current_input[-N_IN:, :]
-
-    x_in = window.reshape(1, N_IN * n_features)
-    x_in_scaled = x_scaler.transform(x_in).reshape(1, N_IN, n_features)
-
-    y_pred_scaled = model.predict(x_in_scaled, verbose=0)
-    y_pred = y_scaler.inverse_transform(y_pred_scaled)[0]
-
-    for v in y_pred:
-        if len(future_preds) < len(future_features):
-            future_preds.append(float(v))
-
-    block_feats = future_features[i : i + N_OUT]
-    if len(block_feats) == 0:
+    new_clim = sim_climate_scaled[t:t + N_OUT]
+    if len(new_clim) == 0:
         break
-    current_input = np.vstack([current_input[len(block_feats):], block_feats])
+    window = np.vstack([window[len(new_clim):], new_clim])
+    t += N_OUT
 
-sim_out = sim_df[[date_col_name, "Year", "Month"]].copy()
-sim_out["runoff_pred"] = future_preds[: len(sim_out)]
+pred_resid = y_scaler.inverse_transform(
+    np.array(pred_scaled_all[:n_sim]).reshape(-1, 1)
+).reshape(-1)
 
-sim_out_path = os.path.join(OUTPUT_DIR, "runoff_simulation_2001_2020.xlsx")
-sim_out.to_excel(sim_out_path, index=False)
+sim_out = sim_df[[DATE_COL, "Year", "Month"]].copy()
+sim_out["residual_pred"] = pred_resid
 
-print("Done.")
-print(f"Model saved to: {model_path}")
-print(f"Simulation output saved to: {sim_out_path}")
+out_path = os.path.join(OUTPUT_DIR, "residual_prediction_2001_2020.xlsx")
+sim_out.to_excel(out_path, index=False)
+
+print("\nDone.")
+print(f"Model:                {model_path}")
+print(f"Predicted residuals:  {out_path}")
+print("Next step (outside this script): corrected runoff  Q_sim = Q_wh + residual_pred")
